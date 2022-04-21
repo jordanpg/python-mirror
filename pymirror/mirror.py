@@ -1,6 +1,8 @@
 
 from dataclasses import dataclass
 
+from pymirror.work import Cohort
+
 @dataclass
 class MirrorOptions:
     """Options for MIRROR simulation"""
@@ -31,3 +33,13 @@ class Mirror:
     def __init__(self, options: MirrorOptions = None):
         self.options = options or self.default_options
         self.last_transaction = 0 # Time when last transaction was created
+        
+    @staticmethod
+    def policy_pa_pb_o2pl(holder: Cohort, requestor: Cohort):
+        """Defines PA_PB state-conscious priority blocking"""
+        pri_h = holder.master.deadline
+        pri_r = requestor.master.deadline
+        
+        passed_demarc = False
+        if holder.is_updater:
+            pass

@@ -32,12 +32,13 @@ class CohortState(Enum):
 
 class Cohort:
     """Models a single process involved in a transaction"""
-    def __init__(self, master: 'Transaction', time: int, page: Page) -> None:
+    def __init__(self, master: 'Transaction', time: int, page: Page, is_updater = False) -> None:
         self.master = master
         self.progress = 0
         self.length = time
         self.state = CohortState.Read
         self.page = page
+        self.is_updater = is_updater
         
     def tick(self):
         self.progress += 1
@@ -53,3 +54,5 @@ class Transaction:
     def __init__(self, sim: Mirror) -> None:
         self.sim = sim
         self.cohorts: list[Cohort] = []
+        
+        self.deadline = time_ns() + 100 # temporary
