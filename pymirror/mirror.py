@@ -54,8 +54,9 @@ class Mirror:
         self.finished = 0
         self.missed = 0
         self.started = 0
+        self.aborts = 0
         self.transactions: list[Transaction] = []
-        self.cpus: list[Cpu] = []
+        # self.cpus: list[Cpu] = []
         self.resources: list[Resource] = []
         self.processes: list[tuple[int, Process]] = []
         self.method = Mirror.pa_pb
@@ -64,18 +65,26 @@ class Mirror:
         self._chance = poisson(options.arrival_rate / 1000, 1) # Calculate probability of transcation arrival each tick
         self._pbar: tqdm = None
     
-    def start_sim(self):
+    def initialize(self):
+        """Initialize the MIRROR simulation"""
         ops = self.options
-        self.cpus = [Cpu() for _ in range(ops.cpu_count)] # Initialize CPUs
+        # self.cpus = [Cpu() for _ in range(ops.cpu_count)] # Initialize CPUs
         self.resources = [Resource(i, ops.replicas) for i in range(ops.db_size)] # Initialize resources
+    
+    def start_sim(self):
+        """Run simulation to completion"""
+        ops = self.options
+        self.initialize()
         
-        with tqdm(total=ops.sim_size,postfix={'Finished':0,'Missed':0,'Clock':0,'Working':0}) as self._pbar:
+        with tqdm(total=ops.sim_size,postfix={'Finished':0,'Missed':0,'Clock':0}) as self._pbar:
             while (self.finished + self.missed) < ops.sim_size:
                 self.tick()
             
         print(f"Finished: {self.finished}/{ops.sim_size}, ({self.finished / ops.sim_size}%)")
         print(f"Missed: {self.missed}/{ops.sim_size}, ({self.missed / ops.sim_size}%)")
         print(f"Bad ticks: {self._badtick}/{self.clock}, ({self._badtick/self.clock}%)")
+        print(f"PA Aborts: {self.aborts}")
+        
     
     def tick(self):
         """Progress the entire simulation by one step"""
@@ -154,7 +163,7 @@ class Transaction:
         self.dependencies: list[Resource] = []
         self.arrival = sim.clock
         self.deadline = -1
-        
+    
     def begin(self):
         ops = self.sim.options
         self.deadline = self.arrival
@@ -192,6 +201,7 @@ class Transaction:
     def restart(self):
         """Abort and then restart if there is time"""
         self.abort()
+        self.sim.aborts += 1
         # If we still have time, restart.
         if self.sim.clock <= self.deadline:
             self.spawn_processes()
@@ -223,7 +233,7 @@ class ProcessState(Enum):
 
 class Process:
     """A process models a working unit of a transaction"""
-    def __init__(self, owner: Transaction, target: 'Resource', length: int, type: ProcessType) -> None:
+    def __init__(self, owner: Transaction, target: 'Resource', length: int, type: ProcessType, spawner: 'Process' = None) -> None:
         self.owner = owner
         self.arrival = owner.sim.clock
         self.length = length
@@ -232,6 +242,8 @@ class Process:
         self.type = type
         self.state = 0
         self.target = target
+        self.spawner = spawner
+        self.finished_updaters = 1
         self.updaters: list[Process] = []
         self.lock: Union[Lock, None] = None
         self.last_tick = 0
@@ -261,11 +273,9 @@ class Process:
                         self.length += self.owner.sim.options.spawn_time
                     return False
             elif self.is_writer:
-                # If all updaters are finished
-                for i in self.updaters:
-                    if i.state < 2:
-                        return False
-                return self.complete()
+                # If all updaters are finished (should trigger earlier)
+                if self.finished_updaters == self.owner.sim.options.replicas:
+                    return self.complete()
                     
         return False
                 
@@ -289,13 +299,26 @@ class Process:
 
             self.length += self.owner.sim.options.spawn_time
             
+        if self.is_updater:
+            self.spawner.updater_finish(self)
+            
         return False
     
     def spawn_updater(self):
         """Create an updater to acquire a lock for the resource"""
-        updater = Process(self.owner, self.target, self.owner.sim.options.write_time, 2)
+        updater = Process(self.owner, self.target, self.owner.sim.options.write_time, 2, self)
         self.updaters.append(updater)
         self.owner.sim.submit_job(updater)
+        
+    def updater_finish(self, u: 'Process'):
+        """Signal to this writer than an updater has finished"""
+        if u not in self.updaters:
+            return
+        
+        self.finished_updaters += 1
+        if self.finished_updaters >= self.owner.sim.options.replicas:
+            # Updaters are all finished, complete
+            self.complete()
     
     def complete(self):
         """Complete and release any locks held by this process or its updaters. The commit phase is presumed to occur here as well."""
@@ -342,10 +365,9 @@ class Process:
             return True
         if self.state != 0 and self.lock is None: # Skip processes that are waiting for a lock
             return True
-        if self.is_writer and not self.spawning: # Skip processes that are waiting for updaters to finish
-            for u in self.updaters:
-                if u.state < 2:
-                    return True
+        if self.is_writer and self.state == 2 and not self.spawning: # Skip processes that are waiting for updaters to finish
+            if self.finished_updaters < self.owner.sim.options.replicas:
+                return True
         if self.is_updater and self.state >= 2: # Skip readied updaters
             return True
         return False
