@@ -41,4 +41,10 @@ def writer():
     assert p.state == ProcessState.Complete
 
 if __name__ == "__main__":
-    writer()
+    # writer()
+    o = MirrorOptions()
+    # o.write_chance = 1
+    # o.sim_size = 100
+    o.arrival_rate = 50
+    m = Mirror(o)
+    m.start_sim()

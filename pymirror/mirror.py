@@ -1,8 +1,13 @@
 from dataclasses import dataclass
 from enum import Enum
 from heapq import heapify, heappop, heappush
+import math
 import random
+from tqdm import tqdm
 from typing import Union
+
+def poisson(lmb, k):
+    return lmb ** k * math.exp(-lmb) / math.factorial(k)
 
 @dataclass
 class MirrorOptions:
@@ -10,6 +15,7 @@ class MirrorOptions:
     db_size = 1000  # Number of resources to generate
     replicas = 4    # Number of replicas for each resource
     cpu_count = 8   # Number of CPUs in the system
+    sim_size = 1000  # Number of transactions to complete
 
     # Timing settings
     access_time = 20        # Number of ticks to access a data item on disk (assumed to be the case)
@@ -36,45 +42,173 @@ class Mirror:
                 return holder.priority < requestor.priority
             return False
         # For workers, block if the process has entered the Contract state
-        if holder.state.value >= ProcessState.Contract:
+        if holder.state >= 2:
             return False
         
         # Otherwise, use priority abort and abort the holder if its priority is lower.
         return holder.priority < requestor.priority
         
-    def __init__(self, options: MirrorOptions = default_options, method = pa_pb) -> None:
+    def __init__(self, options: MirrorOptions = default_options) -> None:
         self.options = options
         self.clock = 0
+        self.finished = 0
+        self.missed = 0
+        self.started = 0
         self.transactions: list[Transaction] = []
-        self.cpus = [Cpu() for _ in range(options.cpu_count)] # Initialize CPUs
-        self.resources = [Resource(i, options.replicas) for i in range(options.db_size)] # Initialize resources
-        self.method = method
+        self.cpus: list[Cpu] = []
+        self.resources: list[Resource] = []
+        self.processes: list[tuple[int, Process]] = []
+        self.method = Mirror.pa_pb
         
+        self._badtick = 0
+        self._chance = poisson(options.arrival_rate / 1000, 1) # Calculate probability of transcation arrival each tick
+        self._pbar: tqdm = None
+    
+    def start_sim(self):
+        ops = self.options
+        self.cpus = [Cpu() for _ in range(ops.cpu_count)] # Initialize CPUs
+        self.resources = [Resource(i, ops.replicas) for i in range(ops.db_size)] # Initialize resources
+        
+        with tqdm(total=ops.sim_size,postfix={'Finished':0,'Missed':0,'Clock':0,'Working':0}) as self._pbar:
+            while (self.finished + self.missed) < ops.sim_size:
+                self.tick()
+            
+        print(f"Finished: {self.finished}/{ops.sim_size}, ({self.finished / ops.sim_size}%)")
+        print(f"Missed: {self.missed}/{ops.sim_size}, ({self.missed / ops.sim_size}%)")
+        print(f"Bad ticks: {self._badtick}/{self.clock}, ({self._badtick/self.clock}%)")
+    
     def tick(self):
         """Progress the entire simulation by one step"""
         self.clock += 1
-        for cpu in self.cpus:
-            cpu.tick()
+        # Kill expired transactions
+        for t in self.transactions:
+            if self.clock > t.deadline:
+                t.abort()
+                self.transaction_finish(t, miss=True)
+                
+        # Determine if we should spawn a new process
+        if random.random() < self._chance:
+            self.create_transaction()
+                
+        # Advance running processes
+        proc = self.pick_processes(self.options.cpu_count)
+        for p in proc:
+            p.tick()
+        if len(proc) == 0:
+            self._badtick += 1
+        
+        # Update progress bar occasionally
+        if self._pbar and self.clock % 100 == 0:
+            self._pbar.set_postfix({'Finished':self.finished,'Missed':self.missed,'Clock':self.clock})
             
     def submit_job(self, p: 'Process') -> 'Cpu':
-        """Assign a job to a random CPU"""
-        cpu = random.choice(self.cpus)
-        cpu.schedule(p)
-        return cpu
+        """Schedule a process"""
+        heappush(self.processes, (p.priority, p))
+    
+    def remove_job(self, p: 'Process'):
+        """Remove a process from the schedule, releasing any locks it is holding"""
+        p.release_all()
+        j = (p.priority,p)
+        if j in self.processes:
+            self.processes.remove(j)
+            heapify(self.processes)
+            
+    def transaction_finish(self, t: 'Transaction', miss = False):
+        """Signal to the simulation that a transaction has completed"""
+        if t not in self.transactions:
+            return
+        if miss:
+            self.missed += 1
+        else:
+            self.finished += 1
+        if self._pbar:
+            self._pbar.set_postfix({'Finished':self.finished,'Missed':self.missed,'Clock':self.clock},refresh=False)
+            self._pbar.update()
+        self.transactions.remove(t)
+        
+    def create_transaction(self) -> 'Transaction':
+        t = Transaction(self)
+        self.transactions.append(t)
+        self.started += 1
+        t.begin()
+        # print(self.processes)
+        return t
+    
+    def pick_processes(self, num: int):
+        """Determine which processes should be running"""
+        chosen: list[Process] = []
+        for (_,p) in self.processes:
+            if p.state == 0: # Always tick a process if it is still in the Begin phase
+                chosen.append(p)
+                continue
+            elif p.blocking: # Skip processes that are blocking
+                continue
+            chosen.append(p)
+        return chosen[:num]
 
 class Transaction:
     """A transaction models a database transaction, spawning processes and awaiting their completion"""
-    def __init__(self, sim: Mirror, curr_time: int) -> None:
+    def __init__(self, sim: Mirror) -> None:
         self.sim = sim
         self.processes: list[Process] = []
-        self.deadline = curr_time
+        self.dependencies: list[Resource] = []
+        self.arrival = sim.clock
+        self.deadline = -1
         
+    def begin(self):
+        ops = self.sim.options
+        self.deadline = self.arrival
+        size = random.randint(*ops.transaction_size)
+        # Pick a collection of random without replacement
+        resources = random.sample(self.sim.resources, size)
+        self.dependencies = resources
+        self.spawn_processes()
+        # Extend deadline based on expected length of each process
+        # i.e., calculate expected length with no buffer or replication
+        self.deadline += sum([ops.access_time + (ops.write_time if p.is_writer else 0) for p in self.processes]) * ops.deadline_slack
+    
+    def spawn_processes(self):
+        ops = self.sim.options
+        resources = self.dependencies
+        # Create processes for each resource we want to access
+        for r in resources:
+            plen = ops.access_time if random.random() > ops.buffered_chance else ops.buffered_time
+            # Add write time for writer processes
+            writer = random.random() < ops.write_chance
+            if writer:
+                plen += ops.write_time
+            # Create and submit the process
+            p = Process(self, r, plen, 1 if writer else 0)
+            self.processes.append(p)
+            self.sim.submit_job(p)
+    
+    def abort(self):
+        """Remove all this transaction's jobs from the simulation"""
+        # Remove all our jobs from the simulation
+        for p in self.processes:
+            self.sim.remove_job(p)
+        self.processes = []
+        
+    def restart(self):
+        """Abort and then restart if there is time"""
+        self.abort()
+        # If we still have time, restart.
+        if self.sim.clock <= self.deadline:
+            self.spawn_processes()
+    
     def commit(self, p: 'Process'):
+        """Notify this transaction that a process is finished, then complete if all processes are finished"""
+        if self.sim.clock > self.deadline:
+            self.sim.transaction_finish(self, miss=True)
+            return
+        
         if p not in self.processes:
             return
         
-        if all([i.state == ProcessState.Complete for i in self.processes]):
-            print("Finished")
+        self.sim.remove_job(p)
+        
+        if all([i.state == 3 for i in self.processes]):
+            self.sim.transaction_finish(self)
 
 class ProcessType(Enum):
     Worker=0b001 # A worker will finish its progress then enter Contract state, and then complete if it is not a writer.
@@ -96,18 +230,19 @@ class Process:
         self.add_length = 0 # Amount of additional work incurred during execution.
         self.progress = 0 # Number of ticks spent on current task
         self.type = type
-        self.state = ProcessState.Begin
+        self.state = 0
         self.target = target
         self.updaters: list[Process] = []
         self.lock: Union[Lock, None] = None
+        self.last_tick = 0
         
     def tick(self) -> bool:
         """Progress this process. Returns True if the process has completed."""
-        if self.state is not ProcessState.Contract:
+        if self.state < 2:
             # Register with resource 
-            if self.state is ProcessState.Begin:
+            if self.state == 0:
                 self.target.acquire(self) # Request a lock on the resource
-                self.state = ProcessState.Expand
+                self.state = 1
             
             # If we aren't blocking, then do some work
             if self.lock is not None:
@@ -128,7 +263,7 @@ class Process:
             elif self.is_writer:
                 # If all updaters are finished
                 for i in self.updaters:
-                    if i.state is not ProcessState.Contract:
+                    if i.state < 2:
                         return False
                 return self.complete()
                     
@@ -136,7 +271,7 @@ class Process:
                 
     def ready(self):
         """Ready this process and do any subsequent work. Returns True if the process has completed."""
-        self.state = ProcessState.Contract
+        self.state = 2
         
         # If we are just a worker, then we no changes to commit and can simply release our lock and finish.
         if self.is_worker:
@@ -158,12 +293,13 @@ class Process:
     
     def spawn_updater(self):
         """Create an updater to acquire a lock for the resource"""
-        updater = Process(self.owner, self.target, self.owner.sim.options.write_time, ProcessType.Updater)
+        updater = Process(self.owner, self.target, self.owner.sim.options.write_time, 2)
         self.updaters.append(updater)
+        self.owner.sim.submit_job(updater)
     
     def complete(self):
         """Complete and release any locks held by this process or its updaters. The commit phase is presumed to occur here as well."""
-        self.state = ProcessState.Complete
+        self.state = 3
         self.release_all()
         self.owner.commit(self)
         return True
@@ -181,33 +317,37 @@ class Process:
     
     @property
     def is_worker(self):
-        return self.type == ProcessType.Worker
+        return self.type == 0
     
     @property
     def is_writer(self):
-        return self.type == ProcessType.Writer
+        return self.type == 1
     
     @property
     def is_updater(self):
-        return self.type == ProcessType.Updater
+        return self.type == 2
     
     @property
     def spawning(self):
         if not self.is_writer:
             return False
-        if self.state is not ProcessState.Contract:
+        if self.state != 2:
             return False
-        return len(self.updaters) < (len(self.target.copies) - 1)
+        return len(self.updaters) < (self.owner.sim.options.replicas-1)
     
     @property
     def blocking(self):
-        if self.state != ProcessState.Begin and not self.lock:
+        """Is True when the process should yield CPU time"""
+        if self.state == 3: # Skip finished processes
             return True
-        if self.is_writer and not self.spawning:
+        if self.state != 0 and self.lock is None: # Skip processes that are waiting for a lock
+            return True
+        if self.is_writer and not self.spawning: # Skip processes that are waiting for updaters to finish
             for u in self.updaters:
-                if u.state.value < ProcessState.Contract.value:
+                if u.state < 2:
                     return True
-                
+        if self.is_updater and self.state >= 2: # Skip readied updaters
+            return True
         return False
     
     def __eq__(self, __o: object) -> bool:
@@ -221,6 +361,8 @@ class Process:
         if not isinstance(__o, Process):
             return False
         if self.priority == __o.priority:
+            if self.arrival == __o.arrival:
+                return self.state < __o.state
             return self.arrival < __o.arrival
         return self.priority < __o.priority
     
@@ -247,7 +389,7 @@ class Cpu:
             return
 
         ind = self.running_index()
-        if ind < 0: # All processes are blocking! 
+        if ind < 0: # All processes are blocking!
             return
         
         # Tick running process, then remove it if it has completed.
@@ -259,7 +401,7 @@ class Cpu:
     def running_index(self):
         """Determine which process should be running"""
         for ind,(_,p) in enumerate(self.processes):
-            if p.state is ProcessState.Begin: # Always tick a process if it is still in the Begin phase
+            if p.state == 0: # Always tick a process if it is still in the Begin phase
                 return ind
             elif p.blocking: # Skip processes that are blocking
                 continue
@@ -269,7 +411,7 @@ class Cpu:
 @dataclass
 class Lock:
     """A lock provides restricted access to a copy of a resource"""
-    holder: Process = None
+    holder: Union[Process, None] = None
 
 class Resource:
     """A Resource models all copies of a resource across all sites, represented as a set of locks"""
@@ -277,14 +419,29 @@ class Resource:
         self.id = id
         self.copies = [Lock() for _ in range(num_copies)]
         self.queue: list[tuple[int, Process]] = [] # Blocking queue
-        
+    
+    def held_by(self, p: Process):
+        for l in self.copies:
+            if l.holder is p:
+                return True
+        return False
+    
     def acquire(self, p: Process) -> bool:
         """Acquire a lock to this resource or enter queue. Returns True if a lock is acquired immediately."""
+        # See if any locks are open
         for c in self.copies:
             if c.holder is None:
                 p.lock = c
                 c.holder = p
                 return True
+        # See if we can use PA to acquire a lock
+        for c in self.copies:
+            if c.holder.owner.sim.method(c.holder, p):
+                c.holder.owner.restart()
+                p.lock = c
+                c.holder = p
+                return True
+        # Otherwise, use PB
         heappush(self.queue, (p.priority, p))
         return False
     
