@@ -24,10 +24,10 @@ def run_test(cpus: int, arrival_rate: int, ops: MirrorOptions = None):
     }
 
 if __name__ == "__main__":
-    prev_datafile = 'results.csv'
-    datafile = 'results.csv'
+    prev_datafile = 'results_100size.csv'
+    datafile = 'results_100size.csv'
     cpu_tests = [8, 16, 32]
-    arrival_rate_tests = range(20,151,5)
+    arrival_rate_tests = range(5,16,5)
     
     # Load existing results if they exist
     results = []
@@ -38,6 +38,7 @@ if __name__ == "__main__":
             results.extend(reader)
     
     ops_template = MirrorOptions()
+    ops_template.db_size = 100
     
     print(f"Writing results to {datafile}...")
     with open(datafile, 'w') as file:
@@ -54,4 +55,4 @@ if __name__ == "__main__":
                 dw.writerow(test)
                 # Stop testing this CPU if the miss percentage has exceeded 90%
                 if test["miss_pct"] > 0.9:
-                    continue
+                    break
